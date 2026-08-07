@@ -9,7 +9,7 @@ pub(crate) fn main() -> Result<()> {
     Runtime::init(Runtime::new().with_handler(handler).run())
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Echo;
 
 #[async_trait]
