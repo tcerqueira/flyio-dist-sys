@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+maelstrom-node = "0.1.6"
+async-trait = "0.1.91"
+tokio-context = "0.1"
