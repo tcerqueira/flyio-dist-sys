@@ -30,6 +30,10 @@ maelstrom test -w unique-ids --bin ~/.cache/cargo/target/debug/unique --time-lim
     --node-count 3 --availability total --nemesis partition
 
 maelstrom serve             # browse results from ./store (gitignored) at localhost:8080
+
+# Append --log-stderr to any test run to stream node stderr to the console as it happens.
+maelstrom test -w broadcast --bin ~/.cache/cargo/target/debug/broadcast \
+    --node-count 1 --time-limit 20 --rate 10 --log-stderr
 ```
 
 There are no `cargo test` unit tests; Maelstrom runs *are* the test suite. Always `cargo build` before a Maelstrom run
@@ -64,7 +68,11 @@ impl Node for Handler {
 `Runtime` owns the stdin/stdout JSON-lines protocol, so handlers only implement workload logic. Key points:
 
 - `done(rt, req)` is the catch-all for message types a handler doesn't own — never drop a message silently.
-- **stdout is the protocol.** Never `println!` for debugging; use `maelstrom::log` (stderr).
+- **stdout is the protocol.** Never `println!` for debugging — `eprintln!` to stderr instead.
+  Maelstrom does *not* pass node stderr through to the terminal by default; it captures it per node into
+  `store/<workload>/latest/node-logs/n<i>.log`. Pass `--log-stderr` to also stream it to the console live.
+  `Runtime::init` installs an `env_logger` defaulting to `info`, so `RUST_LOG` works too and the runtime
+  already traces every message it sends and receives at `info` — expect that noise in the logs.
 - Handlers are `&self` behind an `Arc` and run concurrently, so per-node mutable state needs interior mutability
   (`Mutex`/`RwLock`/atomics) inside the handler struct.
 - `rt.reply` sets `in_reply_to` and, unless the payload already serializes a `type` field, fills in
