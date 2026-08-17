@@ -14,7 +14,7 @@ pub(crate) fn main() -> Result<()> {
 #[derive(Default)]
 struct Broadcast {
     messages: Mutex<HashSet<u64>>,
-    neighbors: RwLock<Vec<String>>,
+    neighbours: RwLock<Vec<String>>,
 }
 
 #[async_trait]
@@ -38,7 +38,7 @@ impl Broadcast {
         }
 
         let nodes = self
-            .neighbors
+            .neighbours
             .read()
             .unwrap()
             .iter()
@@ -63,10 +63,10 @@ impl Broadcast {
             topology: mut topology_req,
         } = req.body.as_obj()?;
 
-        let neighbors = topology_req
+        let neighbours = topology_req
             .remove(rt.node_id())
             .expect("node id present in topology");
-        *self.neighbors.write().unwrap() = neighbors;
+        *self.neighbours.write().unwrap() = neighbours;
 
         rt.reply_ok(req).await
     }
