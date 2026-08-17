@@ -91,7 +91,9 @@ dependencies = [
  "maelstrom-node",
  "rand",
  "serde",
+ "tokio",
  "tokio-context",
+ "tokio-util",
 ]
 
 [[package]]
@@ -552,6 +554,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 

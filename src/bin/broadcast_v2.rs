@@ -3,17 +3,33 @@ use maelstrom::protocol::Message;
 use maelstrom::{Node, Result, Runtime, done};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio::time::{self, MissedTickBehavior};
+use tokio_context::context::Context;
 
 // maelstrom test -w broadcast --bin ~/.cache/cargo/target/debug/broadcast_v2 --node-count 5 --time-limit 20 --rate 10 --nemesis partition
+// maelstrom test -w broadcast --bin ~/.cache/cargo/target/debug/broadcast_v2 --node-count 25 --time-limit 20 --rate 100 --latency 100
 pub(crate) fn main() -> Result<()> {
     let handler = Arc::new(Broadcast::default());
     Runtime::init(Runtime::new().with_handler(handler).run())
 }
 
-#[derive(Default)]
+const GOSSIP_PERIOD: Duration = Duration::from_millis(150);
+
+#[derive(Default, Clone)]
 struct Broadcast {
-    messages: Mutex<HashMap<String, HashSet<u64>>>,
+    inner: Arc<BroadcastInner>,
+}
+
+#[derive(Default)]
+struct BroadcastInner {
+    // lock order: messages before neighbours
+    messages: Mutex<HashSet<u64>>,
+    neighbours: Mutex<HashMap<String, HashSet<u64>>>,
+    gossip_handle: OnceLock<JoinHandle<()>>,
 }
 
 #[async_trait]
@@ -23,7 +39,7 @@ impl Node for Broadcast {
             "broadcast" => self.broadcast(rt, req).await,
             "read" => self.read(rt, req).await,
             "topology" => self.topology(rt, req).await,
-            "broadcast_ok" => Ok(()),
+            "gossip" => self.gossip(rt, req).await,
             _ => done(rt, req),
         }
     }
@@ -32,70 +48,112 @@ impl Node for Broadcast {
 impl Broadcast {
     async fn broadcast(&self, rt: Runtime, req: Message) -> Result<()> {
         let BroadcastRequest { message, .. } = req.body.as_obj()?;
-
-        for (node, diff) in self.gossip_plan(rt.node_id(), &req.src, message) {
-            for message in diff {
-                rt.send_async(node.as_str(), BroadcastRequest::new(message))?;
-            }
-        }
+        self.messages.lock().unwrap().insert(message);
 
         rt.reply_ok(req).await
     }
 
-    fn gossip_plan(&self, node_id: &str, src: &str, message: u64) -> Box<[(String, Vec<u64>)]> {
-        let mut messages = self.messages.lock().unwrap();
-        // register the sender knows about `message`
-        if let Some(sender) = messages.get_mut(src) {
-            sender.insert(message);
-        }
-        // termination condition, if we already know about the `message` dont broadcast it
-        let inserted = messages.entry(node_id.into()).or_default().insert(message);
-        if !inserted {
-            return Box::new([]);
-        }
+    async fn gossip(&self, rt: Runtime, req: Message) -> Result<()> {
+        let GossipRequest { messages, .. } = req.body.as_obj()?;
+        let diff = {
+            let empty = HashSet::new();
+            let mut local = self.messages.lock().unwrap();
+            let mut neighbours = self.neighbours.lock().unwrap();
 
-        let local_msgs = messages.get(node_id).expect("inserted above");
-        messages
+            local.extend(messages.iter().copied());
+            // the sender demonstrably knows what it just sent us
+            if let Some(known) = neighbours.get_mut(&req.src) {
+                known.extend(messages.iter().copied());
+            }
+
+            let known = neighbours.get(&req.src).unwrap_or(&empty);
+            local.difference(known).copied().collect()
+        };
+
+        rt.reply(req, GossipResponse::new(diff)).await
+    }
+
+    fn neighbour_diffs(&self) -> Box<[(String, Vec<u64>)]> {
+        let messages = self.messages.lock().unwrap();
+        let neighbour_msgs = self.neighbours.lock().unwrap();
+        neighbour_msgs
             .iter()
-            .filter(|(node, _)| node.as_str() != node_id && node.as_str() != src)
             .map(|(node, known)| {
-                let diff = local_msgs.difference(known).copied().collect::<Vec<_>>();
+                let diff = messages.difference(known).copied().collect::<Vec<_>>();
                 (node.clone(), diff)
             })
             .collect()
     }
 
+    async fn gossip_task(&self, rt: Runtime) {
+        let mut interval = time::interval(GOSSIP_PERIOD);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            for (node, diff) in self
+                .neighbour_diffs()
+                .into_iter()
+                .filter(|(_, d)| !d.is_empty())
+            {
+                let rt = rt.clone();
+                let this = Arc::clone(self);
+
+                tokio::spawn(async move {
+                    let (ctx, _handle) = Context::with_timeout(GOSSIP_PERIOD * 3);
+                    let batch = diff.into_boxed_slice();
+
+                    let exchange: Result<GossipResponse> = async {
+                        let mut call = rt.rpc(&node, GossipRequest::new(batch.clone())).await?;
+                        call.done_with(ctx).await?.body.as_obj()
+                    }
+                    .await;
+
+                    let Ok(res) =
+                        exchange.inspect_err(|e| eprintln!("gossip to {node} failed: {e}"))
+                    else {
+                        return;
+                    };
+
+                    this.messages
+                        .lock()
+                        .unwrap()
+                        .extend(res.messages.iter().copied());
+                    if let Some(known) = this.neighbours.lock().unwrap().get_mut(&node) {
+                        known.extend(batch);
+                        known.extend(res.messages);
+                    }
+                });
+            }
+        }
+    }
+
     async fn read(&self, rt: Runtime, req: Message) -> Result<()> {
-        let messages: Vec<_> = self
-            .messages
-            .lock()
-            .unwrap()
-            .entry(rt.node_id().into())
-            .or_default()
-            .iter()
-            .copied()
-            .collect();
+        let messages: Vec<_> = self.messages.lock().unwrap().iter().copied().collect();
         rt.reply(req, ReadResponse { messages }).await
     }
 
     async fn topology(&self, rt: Runtime, req: Message) -> Result<()> {
+        self.gossip_handle.get_or_init(|| {
+            let this = self.clone();
+            let rt = rt.clone();
+            tokio::spawn(async move { this.gossip_task(rt).await })
+        });
+
         let TopologyRequest {
             topology: mut topology_req,
         } = req.body.as_obj()?;
 
-        let neighbors = topology_req
+        let neighbours = topology_req
             .remove(rt.node_id())
             .expect("node id present in topology");
 
-        {
-            let mut messages = self.messages.lock().unwrap();
-            let local_msgs = messages.remove(rt.node_id()).unwrap_or_default();
-            *messages = neighbors
-                .into_iter()
-                .map(|node| (node, HashSet::new()))
-                .chain([(rt.node_id().to_string(), local_msgs)])
-                .collect();
-        }
+        *self.neighbours.lock().unwrap() = neighbours
+            .into_iter()
+            .map(|node| (node, HashSet::new()))
+            .collect();
 
         rt.reply_ok(req).await
     }
@@ -108,15 +166,6 @@ struct BroadcastRequest {
     message: u64,
 }
 
-impl BroadcastRequest {
-    fn new(message: u64) -> Self {
-        Self {
-            typ: "broadcast".into(),
-            message,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 struct TopologyRequest {
     topology: HashMap<String, Vec<String>>,
@@ -125,4 +174,44 @@ struct TopologyRequest {
 #[derive(Serialize, Deserialize)]
 struct ReadResponse {
     messages: Vec<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GossipRequest {
+    #[serde(rename = "type")]
+    ty: String,
+    messages: Box<[u64]>,
+}
+
+impl GossipRequest {
+    fn new(messages: Box<[u64]>) -> Self {
+        Self {
+            ty: "gossip".into(),
+            messages,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct GossipResponse {
+    #[serde(rename = "type")]
+    ty: String,
+    messages: Box<[u64]>,
+}
+
+impl GossipResponse {
+    fn new(messages: Box<[u64]>) -> Self {
+        Self {
+            ty: "gossip_ok".into(),
+            messages,
+        }
+    }
+}
+
+impl Deref for Broadcast {
+    type Target = Arc<BroadcastInner>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
