@@ -17,7 +17,10 @@ pub(crate) fn main() -> Result<()> {
     Runtime::init(Runtime::new().with_handler(handler).run())
 }
 
-const GOSSIP_PERIOD: Duration = Duration::from_millis(150);
+// 3d challenge
+const GOSSIP_PERIOD: Duration = Duration::from_millis(175);
+// 3e challenge
+// const GOSSIP_PERIOD: Duration = Duration::from_millis(275);
 
 #[derive(Default, Clone)]
 struct Broadcast {
@@ -142,21 +145,28 @@ impl Broadcast {
             tokio::spawn(async move { this.gossip_task(rt).await })
         });
 
-        let TopologyRequest {
-            topology: mut topology_req,
-        } = req.body.as_obj()?;
-
-        let neighbours = topology_req
-            .remove(rt.node_id())
-            .expect("node id present in topology");
-
-        *self.neighbours.lock().unwrap() = neighbours
-            .into_iter()
-            .map(|node| (node, HashSet::new()))
+        *self.neighbours.lock().unwrap() = row_column_peers(rt.node_id(), rt.nodes())
+            .map(|node| (node.clone(), HashSet::new()))
             .collect();
 
         rt.reply_ok(req).await
     }
+}
+
+/// Row+column overlay over the node list laid out as a `cols x cols` grid: every node peers with
+/// the rest of its row and the rest of its column. Degree ~2(sqrt(N) - 1), diameter 2 -- any two
+/// nodes share either a row or a column with the cell at their intersection.
+fn row_column_peers<'a>(node: &str, nodes: &'a [String]) -> impl Iterator<Item = &'a String> {
+    let cols = (nodes.len() as f64).sqrt().ceil() as usize;
+    let me = nodes.iter().position(|n| n == node);
+
+    nodes
+        .iter()
+        .enumerate()
+        .filter(move |(i, _)| {
+            me.is_some_and(|me| *i != me && (i / cols == me / cols || i % cols == me % cols))
+        })
+        .map(|(_, node)| node)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,11 +174,6 @@ struct BroadcastRequest {
     #[serde(rename = "type")]
     typ: String,
     message: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct TopologyRequest {
-    topology: HashMap<String, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
