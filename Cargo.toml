@@ -10,4 +10,4 @@ maelstrom-node = "0.1.6"
 async-trait = "0.1.91"
 tokio-context = "0.1"
 rand = "0.10"
-serde = "1"
+serde = {version = "1", features = ["rc"] }
